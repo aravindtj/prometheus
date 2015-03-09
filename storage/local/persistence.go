@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/glog"
@@ -400,6 +401,8 @@ func (p *persistence) loadChunks(fp clientmodel.Fingerprint, indexes []int, inde
 		chunk.unmarshal(f)
 		chunks = append(chunks, chunk)
 	}
+	chunkOps.WithLabelValues(load).Add(float64(len(chunks)))
+	atomic.AddInt64(&numMemChunks, int64(len(chunks)))
 	return chunks, nil
 }
 
@@ -497,6 +500,8 @@ func (p *persistence) loadChunkDescs(fp clientmodel.Fingerprint, beforeTime clie
 // (4.8.2) The head chunk itself, marshaled with the marshal() method.
 //
 func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap, fpLocker *fingerprintLocker) (err error) {
+	// TODO(persistence): Write only v2 format.
+	// TODO(persistence): Declare a checkpointed series clean.
 	glog.Info("Checkpointing in-memory metrics and head chunks...")
 	begin := time.Now()
 	f, err := os.OpenFile(p.headsTempFileName(), os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0640)
@@ -625,6 +630,7 @@ func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap
 // this method during start-up while nothing else is running in storage
 // land. This method is utterly goroutine-unsafe.
 func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, err error) {
+	// TODO(persistence): Deal with format v1 and v2.
 	var chunkDescsTotal int64
 	fingerprintToSeries := make(map[clientmodel.Fingerprint]*memorySeries)
 	sm = &seriesMap{m: fingerprintToSeries}
@@ -771,19 +777,24 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, err error) {
 			savedFirstTime:     clientmodel.Timestamp(savedFirstTime),
 			headChunkPersisted: headChunkPersisted,
 			chunkType:          p.chunkType,
+			// TODO(persistence): set persistWatermark
 		}
 	}
 	return sm, nil
 }
 
-// dropChunks deletes all chunks from a series whose last sample time is before
-// beforeTime. It returns the timestamp of the first sample in the oldest chunk
-// _not_ dropped, the number of deleted chunks, and true if all chunks of the
-// series have been deleted (in which case the returned timestamp will be 0 and
-// must be ignored).  It is the caller's responsibility to make sure nothing is
-// persisted or loaded for the same fingerprint concurrently.
-func (p *persistence) dropChunks(fp clientmodel.Fingerprint, beforeTime clientmodel.Timestamp) (
+// dropAndPersistChunks deletes all chunks from a series whose last sample time
+// is before beforeTime and appends the provided chunks (except those whose last
+// sample time is before beforeTime). It returns the timestamp of the first
+// sample in the oldest chunk _not_ dropped, the offset within the series file
+// of the first chunk persisted (out of the provided chunks), the number of
+// deleted chunks, and true if all chunks of the series have been deleted (in
+// which case the returned timestamp will be 0 and must be ignored).  It is the
+// caller's responsibility to make sure nothing is persisted or loaded for the
+// same fingerprint concurrently.
+func (p *persistence) dropAndPersistChunks(fp clientmodel.Fingerprint, beforeTime clientmodel.Timestamp, chunks []chunk) (
 	firstTimeNotDropped clientmodel.Timestamp,
+	offset int,
 	numDropped int,
 	allDropped bool,
 	err error,
@@ -793,67 +804,140 @@ func (p *persistence) dropChunks(fp clientmodel.Fingerprint, beforeTime clientmo
 			p.setDirty(true)
 		}
 	}()
+
+	// First check if the chunks to persist are already too old. If that's
+	// the case, the chunks in the series file are all too old, too.
+	firstToPersist := -1
+	for i, ch := range chunks {
+		if !ch.lastTime().Before(beforeTime) {
+			firstToPersist = i
+			firstTimeNotDropped = ch.firstTime()
+			break
+		}
+	}
+	if len(chunks) > 0 && firstToPersist != 0 {
+		// The whole series file has to go.
+		if numDropped, err = p.deleteSeriesFile(fp); err != nil {
+			return 0, 0, 0, false, err
+		}
+		if firstToPersist == -1 {
+			// Even the chunks to persist are all too old.
+			return 0, 0, numDropped + len(chunks), true, nil
+		}
+		// Now simply persist what has to be persisted to a new file.
+		_, err = p.persistChunks(fp, chunks[firstToPersist:])
+		return firstTimeNotDropped, 0, numDropped + firstToPersist, false, err
+	}
+
 	f, err := p.openChunkFileForReading(fp)
 	if os.IsNotExist(err) {
-		return 0, 0, true, nil
+		// No series file. Only need to create new file with chunks to persist, if there are any.
+		if len(chunks) == 0 {
+			return 0, 0, 0, true, nil
+		}
+		_, err = p.persistChunks(fp, chunks)
+		return firstTimeNotDropped, 0, 0, false, err
 	}
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, 0, false, err
 	}
 	defer f.Close()
 
 	// Find the first chunk that should be kept.
 	var i int
-	var firstTime clientmodel.Timestamp
 	for ; ; i++ {
-		_, err := f.Seek(p.offsetForChunkIndex(i)+chunkHeaderFirstTimeOffset, os.SEEK_SET)
+		_, err = f.Seek(p.offsetForChunkIndex(i), os.SEEK_SET)
 		if err != nil {
-			return 0, 0, false, err
+			return
 		}
-		timeBuf := make([]byte, 16)
-		_, err = io.ReadAtLeast(f, timeBuf, 16)
+		timeBuf := make([]byte, chunkHeaderLen)
+		_, err = io.ReadAtLeast(f, timeBuf, chunkHeaderLen)
 		if err == io.EOF {
 			// We ran into the end of the file without finding any chunks that should
 			// be kept. Remove the whole file.
-			chunkOps.WithLabelValues(drop).Add(float64(i))
-			if err := os.Remove(f.Name()); err != nil {
-				return 0, 0, true, err
+			if _, err = p.deleteSeriesFile(fp); err != nil {
+				return
 			}
-			return 0, i, true, nil
+			if len(chunks) > 0 {
+				_, err = p.persistChunks(fp, chunks)
+			}
+			return firstTimeNotDropped, 0, i, false, err
 		}
 		if err != nil {
-			return 0, 0, false, err
+			return 0, 0, 0, false, err
 		}
-		lastTime := clientmodel.Timestamp(binary.LittleEndian.Uint64(timeBuf[8:]))
+		lastTime := clientmodel.Timestamp(binary.LittleEndian.Uint64(timeBuf[chunkHeaderLastTimeOffset:]))
 		if !lastTime.Before(beforeTime) {
-			firstTime = clientmodel.Timestamp(binary.LittleEndian.Uint64(timeBuf))
+			firstTimeNotDropped = clientmodel.Timestamp(binary.LittleEndian.Uint64(timeBuf[chunkHeaderFirstTimeOffset:]))
 			chunkOps.WithLabelValues(drop).Add(float64(i))
 			break
 		}
 	}
 
-	// We've found the first chunk that should be kept. Seek backwards to the
-	// beginning of its header and start copying everything from there into a new
-	// file.
-	_, err = f.Seek(-(chunkHeaderFirstTimeOffset + 16), os.SEEK_CUR)
+	// We've found the first chunk that should be kept. If it is the first
+	// one, just append the chunks.
+	if i == 0 {
+		if len(chunks) > 0 {
+			offset, err = p.persistChunks(fp, chunks)
+		}
+		return firstTimeNotDropped, offset, 0, false, err
+	}
+	// Otherwise, seek backwards to the beginning of its header and start
+	// copying everything from there into a new file. Then append the chunks
+	// to the new file.
+	_, err = f.Seek(-(chunkHeaderLen), os.SEEK_CUR)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, 0, false, err
 	}
 
 	temp, err := os.OpenFile(p.tempFileNameForFingerprint(fp), os.O_WRONLY|os.O_CREATE, 0640)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, 0, false, err
 	}
 	defer temp.Close()
 
-	if _, err := io.Copy(temp, f); err != nil {
-		return 0, 0, false, err
+	written, err := io.Copy(temp, f)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+
+	if len(chunks) > 0 {
+		b := bufio.NewWriterSize(temp, len(chunks)*(chunkHeaderLen+chunkLen))
+		for _, c := range chunks {
+			err = writeChunkHeader(b, c)
+			if err != nil {
+				return 0, 0, 0, false, err
+			}
+
+			err = c.marshal(b)
+			if err != nil {
+				return 0, 0, 0, false, err
+			}
+		}
+		b.Flush()
 	}
 
 	if err := os.Rename(p.tempFileNameForFingerprint(fp), p.fileNameForFingerprint(fp)); err != nil {
-		return 0, 0, false, err
+		return 0, 0, 0, false, err
 	}
-	return firstTime, i, false, nil
+	return firstTimeNotDropped, int(written / (chunkHeaderLen + chunkLen)), i, false, nil
+}
+
+// deleteSeriesFile deletes a series file belonging to the provided
+// fingerprint. It returns the number of chunks that were contained in the
+// deleted file.
+func (p *persistence) deleteSeriesFile(fp clientmodel.Fingerprint) (int, error) {
+	fname := p.fileNameForFingerprint(fp)
+	fi, err := os.Stat(fname)
+	if err != nil {
+		return -1, err
+	}
+	numChunks := int(fi.Size() / (chunkHeaderLen + chunkLen))
+	if err := os.Remove(fname); err != nil {
+		return -1, err
+	}
+	chunkOps.WithLabelValues(drop).Add(float64(numChunks))
+	return numChunks, nil
 }
 
 // indexMetric queues the given metric for addition to the indexes needed by

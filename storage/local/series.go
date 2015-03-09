@@ -16,19 +16,24 @@ package local
 import (
 	"sort"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	clientmodel "github.com/prometheus/client_golang/model"
 
 	"github.com/prometheus/prometheus/storage/metric"
 )
 
-// chunkDescEvictionFactor is a factor used for chunkDesc eviction (as opposed
-// to evictions of chunks, see method evictOlderThan. A chunk takes about 20x
-// more memory than a chunkDesc. With a chunkDescEvictionFactor of 10, not more
-// than a third of the total memory taken by a series will be used for
-// chunkDescs.
-const chunkDescEvictionFactor = 10
+const (
+	// chunkDescEvictionFactor is a factor used for chunkDesc eviction (as opposed
+	// to evictions of chunks, see method evictOlderThan. A chunk takes about 20x
+	// more memory than a chunkDesc. With a chunkDescEvictionFactor of 10, not more
+	// than a third of the total memory taken by a series will be used for
+	// chunkDescs.
+	chunkDescEvictionFactor = 10
+
+	headChunkTimeout = time.Hour // Close head chunk if not touched for that long.
+
+)
 
 // fingerprintSeriesPair pairs a fingerprint with a memorySeries pointer.
 type fingerprintSeriesPair struct {
@@ -135,31 +140,38 @@ type memorySeries struct {
 	metric clientmodel.Metric
 	// Sorted by start time, overlapping chunk ranges are forbidden.
 	chunkDescs []*chunkDesc
+	// The index (within chunkDescs above) of the first chunkDesc that
+	// points to a non-persisted chunk. If all chunks are persisted, then
+	// persistWatermark == len(chunkDescs).
+	persistWatermark int
 	// The chunkDescs in memory might not have all the chunkDescs for the
 	// chunks that are persisted to disk. The missing chunkDescs are all
 	// contiguous and at the tail end. chunkDescsOffset is the index of the
 	// chunk on disk that corresponds to the first chunkDesc in memory. If
 	// it is 0, the chunkDescs are all loaded. A value of -1 denotes a
 	// special case: There are chunks on disk, but the offset to the
-	// chunkDescs in memory is unknown. Also, there is no overlap between
-	// chunks on disk and chunks in memory (implying that upon first
-	// persisting of a chunk in memory, the offset has to be set).
+	// chunkDescs in memory is unknown. Also, in this special case, there is
+	// no overlap between chunks on disk and chunks in memory (implying that
+	// upon first persisting of a chunk in memory, the offset has to be
+	// set).
 	chunkDescsOffset int
 	// The savedFirstTime field is used as a fallback when the
 	// chunkDescsOffset is not 0. It can be used to save the firstTime of the
 	// first chunk before its chunk desc is evicted. In doubt, this field is
 	// just set to the oldest possible timestamp.
 	savedFirstTime clientmodel.Timestamp
-	// Whether the current head chunk has already been scheduled to be
-	// persisted. If true, the current head chunk must not be modified
-	// anymore.
-	headChunkPersisted bool
+	// Whether the current head chunk has already been finished.  If true,
+	// the current head chunk must not be modified anymore.
+	headChunkClosed bool
 	// Whether the current head chunk is used by an iterator. In that case,
-	// a non-persisted head chunk has to be cloned before more samples are
+	// a non-closed head chunk has to be cloned before more samples are
 	// appended.
 	headChunkUsedByIterator bool
 	// Which type of chunk to create if a new chunk is needed.
 	chunkType byte
+	// Whether the series is inconsistent with the last checkpoint in a way
+	// that would require a desk seek during crash recovery.
+	dirty bool
 }
 
 // newMemorySeries returns a pointer to a newly allocated memorySeries for the
@@ -179,10 +191,10 @@ func newMemorySeries(
 		firstTime = clientmodel.Earliest
 	}
 	s := memorySeries{
-		metric:             m,
-		headChunkPersisted: !reallyNew,
-		savedFirstTime:     firstTime,
-		chunkType:          chunkType,
+		metric:          m,
+		headChunkClosed: !reallyNew,
+		savedFirstTime:  firstTime,
+		chunkType:       chunkType,
 	}
 	if !reallyNew {
 		s.chunkDescsOffset = -1
@@ -190,14 +202,15 @@ func newMemorySeries(
 	return &s
 }
 
-// add adds a sample pair to the series.
-// It returns chunkDescs that must be queued to be persisted.
+// add adds a sample pair to the series. It returns the number of newly
+// completed chunks (which are now eligible for persistence).
+//
 // The caller must have locked the fingerprint of the series.
-func (s *memorySeries) add(fp clientmodel.Fingerprint, v *metric.SamplePair) []*chunkDesc {
-	if len(s.chunkDescs) == 0 || s.headChunkPersisted {
+func (s *memorySeries) add(fp clientmodel.Fingerprint, v *metric.SamplePair) int {
+	if len(s.chunkDescs) == 0 || s.headChunkClosed {
 		newHead := newChunkDesc(chunkForType(s.chunkType))
 		s.chunkDescs = append(s.chunkDescs, newHead)
-		s.headChunkPersisted = false
+		s.headChunkClosed = false
 	} else if s.headChunkUsedByIterator && s.head().getRefCount() > 1 {
 		// We only need to clone the head chunk if the current head
 		// chunk was used in an iterator at all and if the refCount is
@@ -218,19 +231,29 @@ func (s *memorySeries) add(fp clientmodel.Fingerprint, v *metric.SamplePair) []*
 	chunks := s.head().add(v)
 	s.head().chunk = chunks[0]
 
-	var chunkDescsToPersist []*chunkDesc
-	if len(chunks) > 1 {
-		chunkDescsToPersist = append(chunkDescsToPersist, s.head())
-		for i, c := range chunks[1:] {
-			cd := newChunkDesc(c)
-			s.chunkDescs = append(s.chunkDescs, cd)
-			// The last chunk is still growing.
-			if i < len(chunks[1:])-1 {
-				chunkDescsToPersist = append(chunkDescsToPersist, cd)
-			}
-		}
+	for i, c := range chunks[1:] {
+		s.chunkDescs = append(s.chunkDescs, newChunkDesc(c))
 	}
-	return chunkDescsToPersist
+	return len(chunks) - 1
+}
+
+// maybeCloseHeadChunk closes the head chunk if it has not been touched for the
+// duration of headChunkTimeout. It returns wether the head chunk was closed.
+// If the head chunk is already closed, the method is a no-op and returns false.
+//
+// The caller must have locked the fingerprint of the series.
+func (s *memorySeries) maybeCloseHeadChunk() bool {
+	if s.headChunkClosed {
+		return false
+	}
+	if time.Now().Sub(s.head().lastTime().Time()) > headChunkTimeout {
+		s.headChunkClosed = true
+		// Since we cannot modify the head chunk from now on, we
+		// don't need to bother with cloning anymore.
+		s.headChunkUsedByIterator = false
+		return true
+	}
+	return false
 }
 
 // evictChunkDescs evicts chunkDescs if there are chunkDescEvictionFactor times
@@ -248,6 +271,7 @@ func (s *memorySeries) evictChunkDescs(iOldestNotEvicted int) {
 			make([]*chunkDesc, 0, lenToKeep),
 			s.chunkDescs[lenEvicted:]...,
 		)
+		s.dirty = true
 	}
 }
 
@@ -266,6 +290,7 @@ func (s *memorySeries) dropChunks(t clientmodel.Timestamp) (int, bool) {
 	if keepIdx > 0 {
 		s.chunkDescs = append(make([]*chunkDesc, 0, len(s.chunkDescs)-keepIdx), s.chunkDescs[keepIdx:]...)
 		numMemChunkDescs.Sub(float64(keepIdx))
+		s.dirty = true
 	}
 	return keepIdx, len(s.chunkDescs) == 0
 }
@@ -301,10 +326,7 @@ func (s *memorySeries) preloadChunks(indexes []int, mss *memorySeriesStorage) ([
 		for i, c := range chunks {
 			s.chunkDescs[loadIndexes[i]].setChunk(c)
 		}
-		chunkOps.WithLabelValues(load).Add(float64(len(chunks)))
-		atomic.AddInt64(&numMemChunks, int64(len(chunks)))
 	}
-
 	return pinnedChunkDescs, nil
 }
 
@@ -390,7 +412,7 @@ func (s *memorySeries) newIterator(lockFunc, unlockFunc func()) SeriesIterator {
 	chunks := make([]chunk, 0, len(s.chunkDescs))
 	for i, cd := range s.chunkDescs {
 		if chunk := cd.getChunk(); chunk != nil {
-			if i == len(s.chunkDescs)-1 && !s.headChunkPersisted {
+			if i == len(s.chunkDescs)-1 && !s.headChunkClosed {
 				s.headChunkUsedByIterator = true
 			}
 			chunks = append(chunks, chunk)
@@ -418,6 +440,25 @@ func (s *memorySeries) firstTime() clientmodel.Timestamp {
 		return s.chunkDescs[0].firstTime()
 	}
 	return s.savedFirstTime
+}
+
+// getChunksToPersist returns a slice of chunkDescs eligible for
+// persistence. It's the caller's responsibility to actually persist the
+// returned chunks afterwards. The method sets the persistWatermark and the
+// dirty flag accordingly.
+//
+// The caller must have locked the fingerprint of the series.
+func (s *memorySeries) getChunksToPersist() []*chunkDesc {
+	newWatermark := len(s.chunkDescs)
+	if !s.headChunkClosed {
+		newWatermark--
+	}
+	chunksToPersist := s.chunkDescs[s.persistWatermark:newWatermark]
+	if newWatermark != s.persistWatermark {
+		s.dirty = true
+		s.persistWatermark = newWatermark
+	}
+	return chunksToPersist
 }
 
 // memorySeriesIterator implements SeriesIterator.

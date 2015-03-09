@@ -35,6 +35,7 @@ import (
 // queue as started by newPersistence).
 func (p *persistence) recoverFromCrash(fingerprintToSeries map[clientmodel.Fingerprint]*memorySeries) error {
 	// TODO(beorn): We need proper tests for the crash recovery.
+	// TODO(persistence): Needs rework.
 	glog.Warning("Starting crash recovery. Prometheus is inoperational until complete.")
 
 	fpsSeen := map[clientmodel.Fingerprint]struct{}{}
